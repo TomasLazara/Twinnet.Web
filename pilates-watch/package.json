@@ -1,0 +1,12 @@
+{
+  "name": "pilates-reformer-watch",
+  "version": "0.1.0",
+  "private": true,
+  "description": "PWA de Pilates Reformer: repertorio ilustrado, sesiones con avisos al reloj y generador de esferas.",
+  "type": "module",
+  "scripts": {
+    "start": "npx --yes serve -l 5173 .",
+    "test": "node --test tests/*.test.js",
+    "sheet": "node scripts/contact-sheet.mjs contact-sheet.html"
+  }
+}
