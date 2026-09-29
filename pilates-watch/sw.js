@@ -1,6 +1,6 @@
 // Service Worker: funciona offline (app shell en caché) y permite
 // registration.showNotification(), requisito de Chrome en Android.
-const CACHE = 'reformer-watch-v2';
+const CACHE = 'reformer-watch-v3';
 const SHELL = [
   './',
   './index.html',
@@ -22,7 +22,13 @@ const SHELL = [
 ];
 
 self.addEventListener('install', (event) => {
-  event.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));
+  // Cachea archivo por archivo: si alguno falla (p. ej. un host que redirige
+  // íconos a otro dominio), el SW se instala igual y las notificaciones andan.
+  event.waitUntil(
+    caches.open(CACHE)
+      .then((c) => Promise.allSettled(SHELL.map((url) => c.add(url))))
+      .then(() => self.skipWaiting()),
+  );
 });
 
 self.addEventListener('activate', (event) => {
