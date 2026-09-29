@@ -1,6 +1,6 @@
 // Service Worker: funciona offline (app shell en caché) y permite
 // registration.showNotification(), requisito de Chrome en Android.
-const CACHE = 'reformer-watch-v1';
+const CACHE = 'reformer-watch-v2';
 const SHELL = [
   './',
   './index.html',
@@ -14,6 +14,7 @@ const SHELL = [
   './js/figure.js',
   './js/poses.js',
   './js/reformer.js',
+  './js/remote.js',
   './js/routines.js',
   './js/scene.js',
   './js/session.js',

@@ -63,16 +63,37 @@ export function resume(state, now) {
   return { ...state, status: 'running', endsAt: now + state.remainingMs, remainingMs: null };
 }
 
-/** Salta a la siguiente fase (o termina). */
-export function skip(state, now) {
-  if (state.status === 'done') return { state, entered: [] };
-  const index = state.index + 1;
-  if (index >= state.phases.length) return { state: { ...state, status: 'done' }, entered: [] };
+/** Va a la fase `index` con su tiempo completo (respeta la pausa). */
+export function goTo(state, index, now) {
   const ms = state.phases[index].duration * 1000;
   const next = state.status === 'paused'
     ? { ...state, index, remainingMs: ms }
-    : { ...state, index, endsAt: now + ms };
+    : { ...state, index, status: 'running', endsAt: now + ms, remainingMs: null };
   return { state: next, entered: [index] };
+}
+
+/** Como una diapositiva: salta directo al próximo ejercicio (omite transiciones). */
+export function next(state, now) {
+  if (state.status === 'done') return { state, entered: [] };
+  const i = state.phases.findIndex((p, k) => k > state.index && p.kind === 'pose');
+  if (i < 0) return { state: { ...state, status: 'done' }, entered: [] };
+  return goTo(state, i, now);
+}
+
+/**
+ * Como "anterior" en un reproductor: si el ejercicio actual lleva más de
+ * `restartAfterMs`, lo reinicia; si no, vuelve al ejercicio anterior.
+ */
+export function prev(state, now, restartAfterMs = 3000) {
+  if (state.status === 'done') return { state, entered: [] };
+  const cur = state.phases[state.index];
+  const elapsed = cur.duration * 1000 - remainingMs(state, now);
+  if (cur.kind === 'pose' && elapsed > restartAfterMs) return goTo(state, state.index, now);
+  let i = -1;
+  for (let k = state.index - 1; k >= 0; k--) {
+    if (state.phases[k].kind === 'pose') { i = k; break; }
+  }
+  return goTo(state, i < 0 ? state.index : i, now);
 }
 
 /** Texto corto pensado para la pantalla chica del reloj. */

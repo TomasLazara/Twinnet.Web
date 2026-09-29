@@ -1,9 +1,10 @@
 import { POSES, GROUPS, LEVELS, getPose } from './poses.js';
-import { toSVG } from './scene.js';
+import { toSVG, drawScene } from './scene.js';
 import { ROUTINES, loadCustomRoutine, saveCustomRoutine, clampSeconds } from './routines.js';
 import * as S from './session.js';
 import * as D from './device.js';
 import { SCREEN_PRESETS, THEMES, renderWatchFace, fileName, canvasToBlob } from './watchface.js';
+import { WatchRemote } from './remote.js';
 
 // ---------- utilidades DOM (todo texto de usuario va por textContent) ----------
 
@@ -52,6 +53,7 @@ const settings = {
   notifications: true,
   voice: false,
   vibrate: true,
+  watchRemote: true,
   ...store.get('settings', {}),
 };
 const saveSettings = () => store.set('settings', settings);
@@ -279,6 +281,7 @@ function settingsPanel() {
     h('div', { class: 'row' }, num('prep', 'Preparación'), num('transition', 'Transición')),
     check('notifications', 'Notificaciones al reloj', async () => { await D.requestNotifications(); refreshPerm(); }),
     h('p', {}, perm),
+    check('watchRemote', 'Pasar ejercicios desde el reloj (botones ⏮ ⏯ ⏭ de música)'),
     check('vibrate', 'Vibrar el teléfono'),
     check('voice', 'Anunciar por voz'),
     h('button', {
@@ -294,20 +297,70 @@ function settingsPanel() {
 }
 
 // ---------- Sesión ----------
+// El motor corre fuera de la vista: sigue avanzando (y obedeciendo al reloj)
+// aunque estés en otra pestaña o con la pantalla apagada.
 
 let session = null; // { routine, state }
-let loop = null;
+let finished = null; // { routine, total } para la pantalla de cierre
+let engine = null;
+let sessionView = null; // callback de la vista montada
 const screenLock = new D.ScreenLock();
+const remote = new WatchRemote({
+  next: () => command('next'),
+  prev: () => command('prev'),
+  resume: () => command('resume'),
+  pause: () => command('pause'),
+});
 
-async function startSession(routineId) {
+function startSession(routineId) {
   const routine = findRoutine(routineId);
   if (!routine?.items.length) return;
-  if (settings.notifications) await D.requestNotifications();
-  const phases = routinePhases(routine);
-  session = { routine, state: S.start(phases, Date.now()) };
-  await screenLock.enable();
-  announce(0);
+  // El audio del control remoto debe arrancar dentro del click (política de autoplay).
+  if (settings.watchRemote) remote.start().then((ok) => { if (!ok) toast('No se pudo activar el control desde el reloj'); });
+  if (settings.notifications) D.requestNotifications();
+  screenLock.enable();
+  finished = null;
+  session = { routine, state: S.start(routinePhases(routine), Date.now()) };
+  clearInterval(engine);
+  engine = setInterval(step, 250);
+  onEntered([0]);
   location.hash = '#/sesion';
+}
+
+/** Comandos desde la UI, el teclado, los gestos o el reloj. */
+function command(cmd) {
+  if (!session) return;
+  const now = Date.now();
+  const st = session.state;
+  const r = {
+    next: () => S.next(st, now),
+    prev: () => S.prev(st, now),
+    pause: () => ({ state: S.pause(st, now), entered: [] }),
+    resume: () => ({ state: S.resume(st, now), entered: [] }),
+    toggle: () => ({ state: st.status === 'paused' ? S.resume(st, now) : S.pause(st, now), entered: [] }),
+  }[cmd]();
+  session.state = r.state;
+  if (r.entered.length) onEntered(r.entered);
+  else syncRemote();
+  step();
+}
+
+function step() {
+  if (!session) return;
+  const r = S.tick(session.state, Date.now());
+  session.state = r.state;
+  if (r.entered.length) onEntered(r.entered);
+  if (session.state.status === 'done') {
+    finishSession();
+    return;
+  }
+  sessionView?.();
+}
+
+function onEntered(entered) {
+  // Si el teléfono estuvo dormido y se saltearon fases, avisar sólo la actual.
+  announce(entered.at(-1));
+  syncRemote();
 }
 
 function announce(index) {
@@ -318,24 +371,81 @@ function announce(index) {
   if (settings.voice) D.speak(msg.title.replace(/·/g, ','));
 }
 
-function stopSessionView() {
-  clearInterval(loop);
-  loop = null;
+/** Lo que ve el reloj en su pantalla de música: ejercicio, contador y carátula. */
+async function syncRemote() {
+  if (!settings.watchRemote || !session) return;
+  const st = session.state;
+  const phase = st.phases[st.index];
+  const pose = getPose(phase.poseId);
+  const count = st.phases.filter((p) => p.kind === 'pose').length;
+  const artwork = await remote.artworkFor(pose.id, (canvas) => {
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    drawScene(ctx, pose, { x: 8, y: 8, w: canvas.width - 16, h: canvas.height - 16 }, THEMES.mint, { crop: 'figure' });
+  });
+  if (!session) return;
+  const now = Date.now();
+  const st2 = session.state;
+  const label = phase.kind === 'pose' ? `${phase.item + 1}/${count} · ${phase.duration}s` : phase.kind === 'prep' ? 'Preparate' : 'Siguiente';
+  remote.update({
+    title: pose.name,
+    artist: `${label}${st2.status === 'paused' ? ' · en pausa' : ''}`,
+    album: session.routine.name,
+    artwork,
+    duration: phase.duration,
+    position: phase.duration - S.remainingMs(st2, now) / 1000,
+    playing: st2.status === 'running',
+  });
+}
+
+function stopEngine() {
+  clearInterval(engine);
+  engine = null;
+  remote.stop();
+  screenLock.disable();
+}
+
+function finishSession() {
+  finished = { routine: session.routine, total: S.totalSeconds(session.state.phases) };
+  if (settings.notifications) D.notify({ title: 'Sesión completa', body: session.routine.name });
+  if (settings.vibrate) D.vibrate([400, 150, 400, 150, 400]);
+  session = null;
+  stopEngine();
+  if (currentRoute().name === 'sesion') render();
 }
 
 function endSession() {
   session = null;
-  screenLock.disable();
-  stopSessionView();
+  stopEngine();
   render();
 }
 
+function stopSessionView() {
+  sessionView = null;
+}
+
+document.addEventListener('keydown', (e) => {
+  if (!session || currentRoute().name !== 'sesion' || dialog.open) return;
+  if (e.target.closest?.('input, select, textarea')) return;
+  const cmd = { ArrowRight: 'next', ArrowLeft: 'prev', ' ': 'toggle' }[e.key];
+  if (cmd) {
+    e.preventDefault();
+    command(cmd);
+  }
+});
+
 function renderSession() {
   if (!session) {
-    view.append(h('section', { class: 'intro' },
-      h('h2', {}, 'Sesión'),
-      h('p', { class: 'muted' }, 'No hay una sesión en curso.'),
-      h('a', { class: 'btn', href: '#/rutinas' }, 'Elegir rutina')));
+    view.append(finished
+      ? h('section', { class: 'intro' },
+        h('h2', {}, '¡Sesión completa! 🎉'),
+        h('p', { class: 'muted' }, `${finished.routine.name} · ${fmtDuration(finished.total)}`),
+        h('a', { class: 'btn', href: '#/rutinas' }, 'Volver a rutinas'))
+      : h('section', { class: 'intro' },
+        h('h2', {}, 'Sesión'),
+        h('p', { class: 'muted' }, 'No hay una sesión en curso.'),
+        h('a', { class: 'btn', href: '#/rutinas' }, 'Elegir rutina')));
     return;
   }
   const art = h('div', { class: 'art session-art' });
@@ -347,45 +457,37 @@ function renderSession() {
   const cues = h('ul', { class: 'cues' });
   const next = h('p', { class: 'muted' });
   const status = h('p', { class: 'muted small' });
-  const pauseBtn = h('button', { class: 'btn', onclick: () => {
-    const now = Date.now();
-    session.state = session.state.status === 'paused' ? S.resume(session.state, now) : S.pause(session.state, now);
-    update();
-  } });
+  const pauseBtn = h('button', { class: 'btn', onclick: () => command('toggle') });
+  const stage = h('div', { class: 'stage', title: 'Deslizá para cambiar de ejercicio' }, label, art, name, sub, clock, bar);
+
+  // Deslizar como en diapositivas: ← siguiente, → anterior.
+  let startX = null;
+  stage.addEventListener('pointerdown', (e) => { startX = e.clientX; });
+  stage.addEventListener('pointerup', (e) => {
+    if (startX === null) return;
+    const dx = e.clientX - startX;
+    startX = null;
+    if (Math.abs(dx) > 60) command(dx < 0 ? 'next' : 'prev');
+  });
+  stage.addEventListener('pointercancel', () => { startX = null; });
+
   view.append(h('section', { class: 'session' },
-    label, art, name, sub, clock, bar, cues, next,
-    h('div', { class: 'row center' },
+    stage,
+    h('div', { class: 'transport' },
+      h('button', { class: 'btn ghost', 'aria-label': 'Ejercicio anterior', onclick: () => command('prev') }, '⏮'),
       pauseBtn,
-      h('button', { class: 'btn ghost', onclick: () => {
-        const r = S.skip(session.state, Date.now());
-        session.state = r.state;
-        r.entered.forEach(announce);
-        update();
-      } }, 'Saltar ⏭'),
-      h('button', { class: 'btn ghost', onclick: () => { if (confirm('¿Terminar la sesión?')) endSession(); } }, 'Terminar'),
+      h('button', { class: 'btn ghost', 'aria-label': 'Siguiente ejercicio', onclick: () => command('next') }, '⏭'),
+    ),
+    cues, next,
+    h('div', { class: 'row center' },
+      h('button', { class: 'btn ghost small', onclick: () => { if (confirm('¿Terminar la sesión?')) endSession(); } }, 'Terminar sesión'),
     ),
     status));
 
   let shownIndex = -1;
-  function update() {
-    if (!session) return;
+  sessionView = () => {
     const now = Date.now();
-    const r = S.tick(session.state, now);
-    session.state = r.state;
-    // Si el teléfono estuvo dormido y se saltearon fases, avisar sólo la actual.
-    if (r.entered.length) announce(r.entered.at(-1));
     const st = session.state;
-    if (st.status === 'done') {
-      view.replaceChildren(h('section', { class: 'intro' },
-        h('h2', {}, '¡Sesión completa! 🎉'),
-        h('p', { class: 'muted' }, `${session.routine.name} · ${fmtDuration(S.totalSeconds(st.phases))}`),
-        h('a', { class: 'btn', href: '#/rutinas' }, 'Volver a rutinas')));
-      if (settings.notifications) D.notify({ title: 'Sesión completa', body: session.routine.name });
-      session = null;
-      screenLock.disable();
-      stopSessionView();
-      return;
-    }
     const phase = st.phases[st.index];
     const pose = getPose(phase.poseId);
     const poseCount = st.phases.filter((p) => p.kind === 'pose').length;
@@ -405,14 +507,13 @@ function renderSession() {
     bar.value = 1 - left / (phase.duration * 1000);
     pauseBtn.textContent = st.status === 'paused' ? '▶ Seguir' : '⏸ Pausa';
     status.textContent = [
-      screenLock.active ? 'Pantalla activa' : 'Dejá la pantalla encendida',
-      settings.notifications ? `Notificaciones: ${D.notificationPermission() === 'granted' ? 'sí' : 'sin permiso'}` : 'Notificaciones: no',
-    ].join(' · ');
-  }
-  update();
-  loop = setInterval(update, 250);
+      settings.watchRemote ? (remote.active ? 'Control desde el reloj: activo' : 'Control desde el reloj: inactivo') : null,
+      screenLock.active ? 'Pantalla activa' : null,
+      settings.notifications ? `Notificaciones: ${D.notificationPermission() === 'granted' ? 'sí' : 'sin permiso'}` : null,
+    ].filter(Boolean).join(' · ');
+  };
+  sessionView();
 }
-
 
 // ---------- Esferas ----------
 
@@ -582,7 +683,18 @@ function renderWatchGuide() {
       ]),
     ),
     h('article', { class: 'card' },
-      h('h3', {}, '2 · Esfera con la pose'),
+      h('h3', {}, '2 · Pasar ejercicios desde el reloj'),
+      h('p', {}, 'Se usan los botones de música del reloj: ⏭ = siguiente ejercicio, ⏮ = anterior (o reiniciar el actual si ya pasaron 3 s), ⏯ = pausa. En la pantalla de música vas a ver el nombre del ejercicio y el número.'),
+      steps([
+        'En Rutinas → Ajustes dejá activado "Pasar ejercicios desde el reloj".',
+        'En la app del reloj habilitá el control de música (en FitCloudPro suele pedir "acceso a notificaciones" o "control multimedia" en el teléfono).',
+        'Empezá la rutina desde el celular. Después abrí la pantalla de Música del reloj y usá ⏮ ⏯ ⏭.',
+        'Si otra app de música está sonando, el reloj le manda los botones a esa: cerrala antes de la sesión.',
+      ]),
+      h('p', { class: 'muted' }, 'En el celular también podés deslizar la imagen a la izquierda o a la derecha, o usar las flechas del teclado.'),
+    ),
+    h('article', { class: 'card' },
+      h('h3', {}, '3 · Esfera con la pose'),
       steps([
         'Averiguá la resolución de tu pantalla (en la caja, el manual o la ficha del modelo) y elegila en Esferas. Si no figura, usá "Personalizada".',
         'Generá la pose o la rutina y tocá "Guardar en galería" (o descargá el PNG).',

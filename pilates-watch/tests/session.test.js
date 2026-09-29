@@ -45,18 +45,45 @@ test('pausa y reanudación conservan el tiempo restante', () => {
   assert.equal(st.endsAt, 140_000);
 });
 
-test('saltar avanza una fase, también en pausa', () => {
-  const phases = S.buildPhases(routine, { prep: 0, transition: 0 });
-  let st = S.start(phases, 0);
-  let r = S.skip(st, 10_000);
-  assert.deepEqual(r.entered, [1]);
-  assert.equal(r.state.endsAt, 55_000);
-  st = S.pause(r.state, 20_000);
-  r = S.skip(st, 20_000);
-  assert.equal(r.state.index, 2);
-  assert.equal(S.remainingMs(r.state, 0), 30_000);
-  r = S.skip(r.state, 30_000);
+test('next salta directo al próximo ejercicio, omitiendo transiciones', () => {
+  const phases = S.buildPhases(routine, { prep: 5, transition: 8 });
+  let r = S.next(S.start(phases, 0), 2_000); // desde la preparación
+  assert.equal(phases[r.state.index].poseId, 'hundred');
+  assert.equal(r.state.endsAt, 62_000, 'el ejercicio arranca con su tiempo completo');
+  r = S.next(r.state, 10_000); // antes de terminar el tiempo
+  assert.equal(phases[r.state.index].kind, 'pose');
+  assert.equal(phases[r.state.index].poseId, 'elephant');
+  assert.deepEqual(r.entered, [r.state.index]);
+  r = S.next(r.state, 11_000);
+  assert.equal(phases[r.state.index].poseId, 'mermaid');
+  r = S.next(r.state, 12_000);
   assert.equal(r.state.status, 'done');
+});
+
+test('prev reinicia el ejercicio o vuelve al anterior', () => {
+  const phases = S.buildPhases(routine, { prep: 5, transition: 8 });
+  let r = S.next(S.next(S.start(phases, 0), 0).state, 0); // elephant, arrancó en t=0
+  assert.equal(phases[r.state.index].poseId, 'elephant');
+  let back = S.prev(r.state, 10_000); // lleva 10 s → reinicia
+  assert.equal(phases[back.state.index].poseId, 'elephant');
+  assert.equal(back.state.endsAt, 55_000);
+  back = S.prev(r.state, 1_000); // lleva 1 s → ejercicio anterior
+  assert.equal(phases[back.state.index].poseId, 'hundred');
+  // Desde una transición vuelve al ejercicio recién terminado.
+  const t = S.tick(S.start(phases, 0), 5_000 + 60_000).state;
+  assert.equal(phases[t.index].kind, 'transition');
+  assert.equal(phases[S.prev(t, 66_000).state.index].poseId, 'hundred');
+  // En la preparación no hay anterior: reinicia la preparación.
+  assert.equal(S.prev(S.start(phases, 0), 1_000).state.index, 0);
+});
+
+test('next y prev respetan la pausa', () => {
+  const phases = S.buildPhases(routine, { prep: 0, transition: 0 });
+  const paused = S.pause(S.start(phases, 0), 20_000);
+  const r = S.next(paused, 30_000);
+  assert.equal(r.state.status, 'paused');
+  assert.equal(S.remainingMs(r.state, 99_999), 45_000);
+  assert.equal(S.prev(r.state, 40_000).state.index, 0);
 });
 
 test('las notificaciones son cortas para la pantalla del reloj', () => {
